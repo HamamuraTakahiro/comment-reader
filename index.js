@@ -22,6 +22,7 @@ const { chromium } = require('playwright');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 
 // ---- 設定 ---------------------------------------------------------------
 const START_URL = process.argv[2] || 'https://www.spooncast.net/jp/';
@@ -77,10 +78,12 @@ function logFrame(line) {
 // ---- 読み上げキュー(直列実行) ------------------------------------------
 const queue = [];
 let speaking = false;
+let muted = MUTE;          // 実行中に切替可能なミュート状態(初期値は環境変数MUTE)
+let currentChild = null;   // 再生中の say プロセス
 
 function enqueueSpeak(text) {
   if (!text) return;
-  if (MUTE) return; // 無音モード(ログのみ)
+  if (muted) return; // ミュート中はログのみ
   queue.push(text);
   pump();
 }
@@ -92,9 +95,20 @@ function pump() {
   // 文頭の [[volm N]] で音量を指定(0.0〜1.0)。本文中の "[" はsayコマンド誤認を避けエスケープ。
   const safe = text.replace(/[\[\]]/g, ' ');
   const child = spawn('say', ['-v', VOICE, '-r', String(RATE), `[[volm ${VOLUME}]] ${safe}`]);
-  const done = () => { speaking = false; pump(); };
+  currentChild = child;
+  const done = () => { if (currentChild === child) currentChild = null; speaking = false; pump(); };
   child.on('exit', done);
   child.on('error', (e) => { console.error('say 実行エラー:', e.message); done(); });
+}
+
+// 読み上げのオン/オフ切替。OFFにしたら待機中のキューと再生中の音声も止める。
+function toggleMute() {
+  muted = !muted;
+  if (muted) {
+    queue.length = 0;
+    if (currentChild) { try { currentChild.kill(); } catch (_) {} }
+  }
+  console.log(muted ? '🔇 読み上げ: OFF' : '🔊 読み上げ: ON');
 }
 
 // ---- フレーム解析 -------------------------------------------------------
@@ -239,6 +253,9 @@ function isDuplicate(key) {
   return false;
 }
 
+// 直前にコメントしたユーザー名(連投時に名前読み上げを省くため)
+let lastChatNick = null;
+
 // イベント種別ごとに読み上げ文を組み立てる(対象外なら null)
 function buildUtterance(ev) {
   const withNick = (nick, rest) => (READ_NICKNAME && nick ? `${nick} さん、${rest}` : rest);
@@ -246,8 +263,11 @@ function buildUtterance(ev) {
     case 'chat': {
       const body = ev.text.replace(/\s+/g, ' ').trim();
       if (!body) return null;
-      // コメントはユーザー名に「さん」を付けず、名前のあと軽く間を置いて本文を読む
-      return READ_NICKNAME && ev.nickname ? `${ev.nickname}、 ${body}` : body;
+      // 直前のコメントと同じ人なら名前を省略(連投時)。それ以外は名前のあと軽く間を置いて本文。
+      const sameAsPrev = ev.nickname && ev.nickname === lastChatNick;
+      lastChatNick = ev.nickname || null;
+      // コメントはユーザー名に「さん」を付けない
+      return READ_NICKNAME && ev.nickname && !sameAsPrev ? `${ev.nickname}、 ${body}` : body;
     }
     case 'heart': {
       if (!READ_HEARTS) return null;
@@ -415,7 +435,7 @@ async function main() {
   });
 
   console.log('\nブラウザで配信を開いてください。コメントを検知すると読み上げます。');
-  console.log('終了する場合は Ctrl+C か、ブラウザのウィンドウを閉じてください。\n');
+  console.log(`読み上げ: ${muted ? 'OFF' : 'ON'}  [スペース or m] でオン/オフ切替, [q] か Ctrl+C で終了\n`);
 
   // ブラウザが閉じられたら終了
   if (browser) {
@@ -428,11 +448,24 @@ async function main() {
 
   // 終了処理
   const shutdown = async () => {
+    try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch (_) {}
     try { await context.close(); } catch (_) {}
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // キーボード操作: スペース/m で読み上げトグル、q/Ctrl+C で終了
+  if (process.stdin.isTTY) {
+    readline.emitKeypressEvents(process.stdin);
+    try { process.stdin.setRawMode(true); } catch (_) {}
+    process.stdin.resume();
+    process.stdin.on('keypress', (str, key) => {
+      if (!key) return;
+      if ((key.ctrl && key.name === 'c') || key.name === 'q') { shutdown(); return; }
+      if (key.name === 'space' || key.name === 'm') toggleMute();
+    });
+  }
 }
 
 main().catch((e) => {
