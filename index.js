@@ -40,7 +40,11 @@ const READ_NICKNAME = process.env.NO_NICKNAME !== '1';
 const READ_HEARTS = process.env.NO_HEARTS !== '1';   // ハート(無料いいね)を読み上げる
 const READ_PRESENTS = process.env.NO_PRESENTS !== '1'; // Spoon投げ/有料いいね等のプレゼントを読み上げる
 const READ_JOINS = process.env.NO_JOINS !== '1';       // 入室を読み上げる
-const SOSHINA_ITEM_ID = 34;                            // 「心ばかりの粗品」ギフトのitemId
+// 特別読み上げするアイテム(itemId → 読み上げ文)。未登録のアイテムはidを付けて読み上げる。
+const SPECIAL_ITEMS = {
+  34: '貴重な粗品をありがと！',          // 心ばかりの粗品
+  35: '貴重なルーレットハートありがと！', // ルーレットハート
+};
 // 読み上げ対象の WebSocket だけに絞るためのURLフィルタ(部分一致)。空なら全部対象。
 const WS_FILTER = process.env.WS_FILTER || '';
 
@@ -202,10 +206,11 @@ function extractEvents(node, out) {
       // itemId 34 は「心ばかりの粗品」ギフト。effectType "LIKE" はハート。それ以外はアイテム(プレゼント扱い)。
       const nickname = pickNick(ep) || pickNick(ep.generator);
       const combo = Number(ep.combo) || 1;
-      if (ep.itemId === SOSHINA_ITEM_ID) {
-        out.push({ kind: 'soshina', nickname, ts });
+      const phrase = SPECIAL_ITEMS[ep.itemId];
+      if (phrase) {
+        out.push({ kind: 'gift', nickname, phrase, ts });
       } else {
-        // 粗品以外のアイテムは、どのアイテムか分かるよう itemId を付けて読み上げる
+        // 未登録のアイテムは、どのアイテムか分かるよう itemId を付けて読み上げる
         out.push({ kind: 'heart', nickname, count: combo, itemId: ep.itemId, ts });
       }
       return;
@@ -297,9 +302,9 @@ function buildUtterance(ev) {
       if (ev.itemId != null) c += `（アイテム${ev.itemId}）`; // アイテム系はidを付けて識別
       return withNick(ev.nickname, c);
     }
-    case 'soshina': {
+    case 'gift': {
       if (!READ_PRESENTS) return null;
-      return withNick(ev.nickname, '貴重な粗品をありがと！');
+      return withNick(ev.nickname, ev.phrase);
     }
     case 'present': {
       if (!READ_PRESENTS) return null;
@@ -438,7 +443,7 @@ async function main() {
         const id = ev.kind === 'chat' ? ev.text
           : ev.kind === 'heart' ? `heart:${ev.itemId ?? ''}:${ev.count}`
           : ev.kind === 'join' ? 'join'
-          : ev.kind === 'soshina' ? 'soshina'
+          : ev.kind === 'gift' ? `gift:${ev.phrase}`
           : `${ev.eventName}:${ev.amount}:${ev.combo}`;
         const key = `${ev.kind}::${ev.ts || ''}::${ev.nickname || ''}::${id}`;
         if (isDuplicate(key)) continue;
@@ -449,7 +454,7 @@ async function main() {
         const icon = ev.kind === 'chat' ? '💬'
           : ev.kind === 'heart' ? '🩷'
           : ev.kind === 'join' ? '👋'
-          : ev.kind === 'soshina' ? '🎁'
+          : ev.kind === 'gift' ? '🎁'
           : '🥄';
         console.log(`${icon} ${ev.nickname ? ev.nickname + ': ' : ''}${utterance}`);
         enqueueSpeak(utterance);
