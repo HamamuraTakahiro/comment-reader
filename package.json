@@ -1,0 +1,14 @@
+{
+  "name": "comment-reader",
+  "version": "1.0.0",
+  "description": "Spooncastライブ配信のコメントを音声読み上げするツール",
+  "private": true,
+  "type": "commonjs",
+  "bin": { "comment-reader": "index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}

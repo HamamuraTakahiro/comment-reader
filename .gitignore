@@ -1,0 +1,10 @@
+frames.log
+node_modules/
+.browser-profile/
+network.log
+capture.out
+capture2.out
+e2e.out
+run.out
+.capture-profile/
+.cap2/
