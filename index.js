@@ -40,6 +40,7 @@ const READ_NICKNAME = process.env.NO_NICKNAME !== '1';
 const READ_HEARTS = process.env.NO_HEARTS !== '1';   // ハート(無料いいね)を読み上げる
 const READ_PRESENTS = process.env.NO_PRESENTS !== '1'; // Spoon投げ/有料いいね等のプレゼントを読み上げる
 const READ_JOINS = process.env.NO_JOINS !== '1';       // 入室を読み上げる
+const SOSHINA_ITEM_ID = 34;                            // 「心ばかりの粗品」ギフトのitemId
 // 読み上げ対象の WebSocket だけに絞るためのURLフィルタ(部分一致)。空なら全部対象。
 const WS_FILTER = process.env.WS_FILTER || '';
 
@@ -197,15 +198,15 @@ function extractEvents(node, out) {
       return;
     }
     case 'LiveItemUse': {
-      // アイテム使用: { nickname, effectType, amount, combo }
-      // effectType が "LIKE" のものは特別なハート。それ以外はアイテム(プレゼント扱い)。
+      // アイテム使用: { nickname, itemId, effectType, amount, combo }
+      // itemId 34 は「心ばかりの粗品」ギフト。effectType "LIKE" はハート。それ以外はアイテム(プレゼント扱い)。
       const nickname = pickNick(ep) || pickNick(ep.generator);
       const combo = Number(ep.combo) || 1;
-      if (ep.effectType === 'LIKE') {
-        out.push({ kind: 'heart', nickname, count: combo, ts });
+      if (ep.itemId === SOSHINA_ITEM_ID) {
+        out.push({ kind: 'soshina', nickname, ts });
       } else {
-        const amount = Number(ep.amount) || null;
-        out.push({ kind: 'present', nickname, amount, combo, message: null, eventName: body.eventName, ts });
+        // 粗品以外のアイテムは、どのアイテムか分かるよう itemId を付けて読み上げる
+        out.push({ kind: 'heart', nickname, count: combo, itemId: ep.itemId, ts });
       }
       return;
     }
@@ -280,16 +281,25 @@ function buildUtterance(ev) {
   const withNick = (nick, rest) => (READ_NICKNAME && nick ? `${nick} さん、${rest}` : rest);
   switch (ev.kind) {
     case 'chat': {
-      // コメントはユーザー名を読まず本文のみ。絵文字は除去し、笑い表記(w/笑)を変換。
+      // コメントはユーザー名を読まず本文のみ。
       let body = stripEmoji(ev.text.replace(/\s+/g, ' ').trim());
-      body = normalizeLaughter(body).replace(/\s+/g, ' ').trim();
+      // URLは内容を読まず定型文に置換(スラッシュ変換より先に)
+      body = body.replace(/https?:\/\/\S+/gi, ' URLのリンクが貼られました ');
+      body = normalizeLaughter(body);
+      body = body.replace(/\/{2,}/g, 'てれてれ'); // スラッシュ連続 → てれてれ
+      body = body.replace(/\s+/g, ' ').trim();
       if (!body) return null; // 絵文字のみ等で本文が空なら読み上げない
       return body;
     }
     case 'heart': {
       if (!READ_HEARTS) return null;
-      const c = ev.count > 1 ? `ハート${ev.count}` : 'ハート';
+      let c = ev.count > 1 ? `ハート${ev.count}ありがと！` : 'ハートありがと！';
+      if (ev.itemId != null) c += `（アイテム${ev.itemId}）`; // アイテム系はidを付けて識別
       return withNick(ev.nickname, c);
+    }
+    case 'soshina': {
+      if (!READ_PRESENTS) return null;
+      return withNick(ev.nickname, '貴重な粗品をありがと！');
     }
     case 'present': {
       if (!READ_PRESENTS) return null;
@@ -313,8 +323,6 @@ function buildUtterance(ev) {
 function looksLikeChat(text) {
   if (!text) return false;
   if (text.length > 200) return false;            // 長すぎる=システムpayloadの可能性
-  if (/^https?:\/\/\S+$/.test(text)) return false; // URLのみ
-  if (/^[\d.\-:T_]+$/.test(text)) return false;    // 数値/タイムスタンプのみ
   return true;
 }
 
@@ -428,8 +436,9 @@ async function main() {
         if (ev.kind === 'chat' && !looksLikeChat(ev.text)) continue;
         // 重複排除キー(同一フレーム二重配信や再送に備える)
         const id = ev.kind === 'chat' ? ev.text
-          : ev.kind === 'heart' ? `heart:${ev.count}`
+          : ev.kind === 'heart' ? `heart:${ev.itemId ?? ''}:${ev.count}`
           : ev.kind === 'join' ? 'join'
+          : ev.kind === 'soshina' ? 'soshina'
           : `${ev.eventName}:${ev.amount}:${ev.combo}`;
         const key = `${ev.kind}::${ev.ts || ''}::${ev.nickname || ''}::${id}`;
         if (isDuplicate(key)) continue;
@@ -440,6 +449,7 @@ async function main() {
         const icon = ev.kind === 'chat' ? '💬'
           : ev.kind === 'heart' ? '🩷'
           : ev.kind === 'join' ? '👋'
+          : ev.kind === 'soshina' ? '🎁'
           : '🥄';
         console.log(`${icon} ${ev.nickname ? ev.nickname + ': ' : ''}${utterance}`);
         enqueueSpeak(utterance);
