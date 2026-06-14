@@ -253,21 +253,38 @@ function isDuplicate(key) {
   return false;
 }
 
-// 直前にコメントしたユーザー名(連投時に名前読み上げを省くため)
-let lastChatNick = null;
+// 絵文字を除去する(国旗/異体字セレクタ/ZWJ/キーキャップ含む)
+function stripEmoji(s) {
+  return s
+    .replace(/\p{Extended_Pictographic}/gu, '')
+    .replace(/\p{Emoji_Modifier}/gu, '')                    // 肌色(スキントーン)修飾子
+    .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '')                  // 国旗(地域指示子)
+    .replace(/[︀-️‍⃣]/gu, '')            // 異体字セレクタ/ZWJ/キーキャップ
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// 笑い表記(w / 笑)を読み上げ用に変換する。
+//   2文字以上の連続 → わらわら / 1文字 → わら
+//   w は英単語の一部を誤変換しないよう、前後が英字でない場合のみ対象。
+function normalizeLaughter(s) {
+  return s
+    .replace(/(?<![A-Za-zＡ-Ｚａ-ｚ])[wｗ]{2,}(?![A-Za-zＡ-Ｚａ-ｚ])/g, 'わらわら')
+    .replace(/笑{2,}/g, 'わらわら')
+    .replace(/(?<![A-Za-zＡ-Ｚａ-ｚ])[wｗ](?![A-Za-zＡ-Ｚａ-ｚ])/g, 'わら')
+    .replace(/笑/g, 'わら');
+}
 
 // イベント種別ごとに読み上げ文を組み立てる(対象外なら null)
 function buildUtterance(ev) {
   const withNick = (nick, rest) => (READ_NICKNAME && nick ? `${nick} さん、${rest}` : rest);
   switch (ev.kind) {
     case 'chat': {
-      const body = ev.text.replace(/\s+/g, ' ').trim();
-      if (!body) return null;
-      // 直前のコメントと同じ人なら名前を省略(連投時)。それ以外は名前のあと軽く間を置いて本文。
-      const sameAsPrev = ev.nickname && ev.nickname === lastChatNick;
-      lastChatNick = ev.nickname || null;
-      // コメントはユーザー名に「さん」を付けない
-      return READ_NICKNAME && ev.nickname && !sameAsPrev ? `${ev.nickname}、 ${body}` : body;
+      // コメントはユーザー名を読まず本文のみ。絵文字は除去し、笑い表記(w/笑)を変換。
+      let body = stripEmoji(ev.text.replace(/\s+/g, ' ').trim());
+      body = normalizeLaughter(body).replace(/\s+/g, ' ').trim();
+      if (!body) return null; // 絵文字のみ等で本文が空なら読み上げない
+      return body;
     }
     case 'heart': {
       if (!READ_HEARTS) return null;
