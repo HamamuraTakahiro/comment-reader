@@ -679,6 +679,9 @@ async function main() {
   console.log(`読み上げ: ${muted ? 'OFF' : 'ON'} / 音量: ${Math.round(currentVolume * 100)}%`);
   console.log('[スペース or m] オン/オフ, [c] 途中キャンセル, [0-9] 音量(0〜90%), [q]/Ctrl+C 終了\n');
 
+  // 起動アナウンス(ミュート中でも鳴らす)
+  if (!muted) forceSpeak('読み上げを開始します。');
+
   // Chromeが閉じられた/接続が切れたら終了
   if (browser) {
     browser.on('disconnected', () => process.exit(0));
