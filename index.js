@@ -28,12 +28,13 @@ const readline = require('readline');
 const START_URL = process.argv[2] || 'https://www.spooncast.net/jp/';
 const VOICE = process.env.VOICE || 'Kyoko (Enhanced)';
 const RATE = process.env.RATE || '200';            // say の話速(語/分)
-// 音量(0.0〜1.0)。既定は0.5(半分)。
+// 音量(0.0〜1.0)。既定は0.5(半分)。実行中に数字キーで変更可能。
 const VOLUME = (() => {
   const v = parseFloat(process.env.VOLUME);
   if (Number.isNaN(v)) return 0.5;
   return Math.max(0, Math.min(1, v));
 })();
+let currentVolume = VOLUME;
 const DEBUG = process.env.DEBUG === '1';
 const MUTE = process.env.MUTE === '1';             // 音声を出さずログのみ
 const READ_NICKNAME = process.env.NO_NICKNAME !== '1';
@@ -140,21 +141,39 @@ function pump() {
   const text = queue.shift();
   // 文頭の [[volm N]] で音量を指定(0.0〜1.0)。本文中の "[" はsayコマンド誤認を避けエスケープ。
   const safe = text.replace(/[\[\]]/g, ' ');
-  const child = spawn('say', ['-v', VOICE, '-r', String(RATE), `[[volm ${VOLUME}]] ${safe}`]);
+  const child = spawn('say', ['-v', VOICE, '-r', String(RATE), `[[volm ${currentVolume}]] ${safe}`]);
   currentChild = child;
   const done = () => { if (currentChild === child) currentChild = null; speaking = false; pump(); };
   child.on('exit', done);
   child.on('error', (e) => { console.error('say 実行エラー:', e.message); done(); });
 }
 
+// ミュート状態に関係なく必ず読み上げる(オン/オフのアナウンス用)
+function forceSpeak(text) {
+  queue.push(text);
+  pump();
+}
+
 // 読み上げのオン/オフ切替。OFFにしたら待機中のキューと再生中の音声も止める。
+// 切替はリスナーにも分かるよう音声でもアナウンスする。
 function toggleMute() {
   muted = !muted;
   if (muted) {
     queue.length = 0;
     if (currentChild) { try { currentChild.kill(); } catch (_) {} }
+    console.log('🔇 読み上げ: OFF');
+    forceSpeak('コメント読み上げをオフにしました');
+  } else {
+    console.log('🔊 読み上げ: ON');
+    forceSpeak('コメント読み上げをオンにしました');
   }
-  console.log(muted ? '🔇 読み上げ: OFF' : '🔊 読み上げ: ON');
+}
+
+// 読み上げの途中キャンセル。再生中の音声を止め、待機中のキューも破棄(ミュートにはしない)。
+function cancelSpeech() {
+  queue.length = 0;
+  if (currentChild) { try { currentChild.kill(); } catch (_) {} }
+  console.log('⏭️ 読み上げをキャンセルしました');
 }
 
 // ---- フレーム解析 -------------------------------------------------------
@@ -408,82 +427,74 @@ async function main() {
     console.log(`[DEBUG] 受信フレームを表示し、${FRAME_LOG} に保存します`);
   }
 
-  // 前回のブラウザが残したまま終了した場合、SingletonLockが残って
-  // 「既存セッションに合流」して起動失敗するので、持ち主プロセスがいなければ掃除する。
-  clearStaleSingletonLock(USER_DATA_DIR);
+  // 配信を切らずにツールだけ止められるように、Chromeは独立プロセスとして起動し
+  // CDPで「接続」する。Ctrl+Cでツールが終了してもChrome(=配信)は生き残り、
+  // 再起動すると生きているChromeに再接続して読み上げを再開できる。
+  const CDP_PORT = parseInt(process.env.CDP_PORT, 10) || 9222;
+  const CDP_ENDPOINT = `http://127.0.0.1:${CDP_PORT}`;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // プロファイルを永続化(一度ログインすれば次回以降は維持) + 自動化検知の抑制。
-  // 実Chromeを優先し、無ければバンドルChromiumにフォールバック。
-  const launchOpts = {
-    headless: process.env.HEADLESS === '1',
-    locale: 'ja-JP',
-    viewport: null,
-    args: ['--disable-blink-features=AutomationControlled'],
-    ignoreDefaultArgs: ['--enable-automation'],
-  };
-  let context;
+  let browser = null;
   try {
-    context = await chromium.launchPersistentContext(USER_DATA_DIR, { channel: 'chrome', ...launchOpts });
-    console.log('ブラウザ: Google Chrome (プロファイル永続化)');
-  } catch (e) {
-    console.log('Chromeを起動できなかったためバンドルChromiumを使用します:', e.message);
-    context = await chromium.launchPersistentContext(USER_DATA_DIR, launchOpts);
-  }
-  const browser = context.browser();
-
-  // navigator.webdriver を隠す(自動化検知の追加対策)
-  await context.addInitScript(() => {
-    try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (_) {}
-  });
-
-  // payload(string or Buffer)を文字列化。バイナリでも中身がUTF-8/JSONなら拾える。
-  function payloadToString(payload) {
-    if (typeof payload === 'string') return payload;
-    if (payload && typeof payload === 'object' && typeof payload.toString === 'function') {
-      try { return payload.toString('utf8'); } catch (_) { return null; }
+    browser = await chromium.connectOverCDP(CDP_ENDPOINT);
+    console.log('既存のChromeに再接続しました(配信は維持されます)');
+  } catch (_) {
+    clearStaleSingletonLock(USER_DATA_DIR);
+    const chromePath = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    const args = [
+      `--remote-debugging-port=${CDP_PORT}`,
+      `--user-data-dir=${USER_DATA_DIR}`,
+      '--no-first-run', '--no-default-browser-check',
+      '--disable-blink-features=AutomationControlled',
+      START_URL,
+    ];
+    const child = spawn(chromePath, args, { detached: true, stdio: 'ignore' });
+    child.unref();
+    for (let i = 0; i < 60 && !browser; i++) {
+      await sleep(300);
+      try { browser = await chromium.connectOverCDP(CDP_ENDPOINT); } catch (_) {}
     }
-    return null;
+    if (!browser) { console.error('Chromeへの接続に失敗しました'); process.exit(1); }
+    console.log('Google Chrome を起動しました(プロファイル永続化)');
   }
 
-  let frameCount = 0;
-  function attachWS(ws, page) {
-    const url = ws.url();
-    if (WS_FILTER && !url.includes(WS_FILTER)) return;
-    console.log(`[WS] 接続: ${url}`);
-    logFrame(`[WS-OPEN] ${url}`);
+  // CDP接続では既存のデフォルトコンテキストを使う
+  const context = browser.contexts()[0] || (await browser.newContext({ locale: 'ja-JP' }));
 
-    ws.on('framereceived', (frame) => {
-      const str = payloadToString(frame.payload);
-      frameCount++;
-      if (DEBUG) {
-        const kind = typeof frame.payload === 'string' ? 'text' : 'bin';
-        const body = str == null ? '(decode不可)' : (str.length > 600 ? str.slice(0, 600) + '…' : str);
-        console.log(`[FRAME #${frameCount} ${kind} ${str ? str.length : 0}B] ${body}`);
-        logFrame(`[RECV ${kind}] ${str == null ? '(decode不可)' : str}`);
-      }
-      if (str != null) handlePayload(str);
-    });
-
-    if (DEBUG) {
-      ws.on('framesent', (frame) => {
-        const str = payloadToString(frame.payload);
-        if (str != null) {
-          console.log(`[SENT] ${str.length > 300 ? str.slice(0, 300) + '…' : str}`);
-          logFrame(`[SENT] ${str}`);
-        }
-      });
-      ws.on('socketerror', (e) => console.log(`[WS] error: ${e}`));
-    }
-    ws.on('close', () => console.log(`[WS] 切断: ${url}`));
-  }
-
-  // 全ページ(初期ページ＋新規タブ/ポップアップ)のWebSocketを捕捉
   const NETWORK_LOG = path.join(__dirname, 'network.log');
   if (DEBUG) { try { fs.writeFileSync(NETWORK_LOG, ''); } catch (_) {} }
-  function attachPage(page) {
-    page.on('websocket', (ws) => attachWS(ws, page));
+
+  // WebSocket傍受はCDPのNetworkドメインで行う。これなら接続前から開いている
+  // ソケット(再接続時の既存チャットWS)のフレームも取得できる。
+  async function attachPage(page) {
+    try {
+      const client = await context.newCDPSession(page);
+      await client.send('Network.enable');
+      const wsUrl = new Map();
+      client.on('Network.webSocketCreated', (e) => {
+        wsUrl.set(e.requestId, e.url);
+        if (!WS_FILTER || (e.url || '').includes(WS_FILTER)) {
+          console.log(`[WS] 接続: ${e.url}`);
+          logFrame(`[WS-OPEN] ${e.url}`);
+        }
+      });
+      client.on('Network.webSocketFrameReceived', (e) => {
+        const url = wsUrl.get(e.requestId) || '';
+        if (WS_FILTER && !url.includes(WS_FILTER)) return;
+        const str = e.response && e.response.payloadData;
+        if (typeof str !== 'string') return;
+        if (DEBUG) logFrame(`[RECV] ${str}`);
+        handlePayload(str);
+      });
+      if (DEBUG) {
+        client.on('Network.webSocketFrameSent', (e) => {
+          const str = e.response && e.response.payloadData;
+          if (typeof str === 'string') logFrame(`[SENT] ${str}`);
+        });
+      }
+    } catch (err) { if (DEBUG) console.log('CDP接続(WS)失敗:', err.message); }
+
     if (DEBUG) {
-      // チャットがHTTP(XHR/fetch)で来ている可能性に備え、APIのURLを記録
       page.on('request', (req) => {
         const u = req.url();
         if (/spoon|live|message|chat|comment|firebase/i.test(u)) {
@@ -494,10 +505,10 @@ async function main() {
   }
   context.on('page', attachPage);
 
-  // 永続コンテキストには既定ページが1枚あるのでそれを再利用(なければ新規作成)
+  // 既存ページ(再接続時は配信ページ)を再利用。無ければ新規作成。
   const existing = context.pages();
   const page = existing.length > 0 ? existing[0] : await context.newPage();
-  for (const p of existing) attachPage(p);
+  for (const p of existing) await attachPage(p);
 
   // 1イベントを処理(重複排除→呼び名登録→読み上げ)
   function emitEvent(ev) {
@@ -655,26 +666,28 @@ async function main() {
     // ポーリングは行わず、memberCount(人型の数値)が変化したタイミングで一覧取得する
   }
 
-  await page.goto(START_URL, { waitUntil: 'domcontentloaded' }).catch((e) => {
-    console.error('ページ読み込みエラー:', e.message);
-  });
+  // 空白ページのときだけ配信ページへ遷移(既に配信を開いている場合は触らない)
+  try {
+    const cur = (page.url() || '');
+    if (!cur || cur === 'about:blank' || cur.startsWith('chrome://')) {
+      await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
+    }
+  } catch (e) { console.error('ページ読み込みエラー:', e.message); }
 
   console.log('\nブラウザで配信を開いてください。コメントを検知すると読み上げます。');
-  console.log(`読み上げ: ${muted ? 'OFF' : 'ON'}  [スペース or m] でオン/オフ切替, [q] か Ctrl+C で終了\n`);
+  console.log('※ Ctrl+C / q で終了してもブラウザ(配信)は開いたままです。');
+  console.log(`読み上げ: ${muted ? 'OFF' : 'ON'} / 音量: ${Math.round(currentVolume * 100)}%`);
+  console.log('[スペース or m] オン/オフ, [c] 途中キャンセル, [0-9] 音量(0〜90%), [q]/Ctrl+C 終了\n');
 
-  // ブラウザが閉じられたら終了
+  // Chromeが閉じられた/接続が切れたら終了
   if (browser) {
-    browser.on('disconnected', () => {
-      console.log('ブラウザが閉じられました。終了します。');
-      process.exit(0);
-    });
+    browser.on('disconnected', () => process.exit(0));
   }
-  context.on('close', () => process.exit(0));
 
-  // 終了処理
+  // 終了処理: ブラウザは閉じない(配信を継続させる)。CDP接続を切るだけ。
   const shutdown = async () => {
     try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch (_) {}
-    try { await context.close(); } catch (_) {}
+    console.log('\n読み上げを終了します（配信・ブラウザはそのまま継続します）');
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
@@ -688,7 +701,13 @@ async function main() {
     process.stdin.on('keypress', (str, key) => {
       if (!key) return;
       if ((key.ctrl && key.name === 'c') || key.name === 'q') { shutdown(); return; }
-      if (key.name === 'space' || key.name === 'm') toggleMute();
+      if (key.name === 'space' || key.name === 'm') { toggleMute(); return; }
+      if (key.name === 'c' && !key.ctrl) { cancelSpeech(); return; } // 途中キャンセル
+      // 数字キー 0〜9 で音量を 0.0〜0.9 に設定(0=無音, 5=50%, 9=90%)
+      if (str && /^[0-9]$/.test(str)) {
+        currentVolume = Number(str) / 10;
+        console.log(`🔊 音量: ${Math.round(currentVolume * 100)}%`);
+      }
     });
   }
 }
