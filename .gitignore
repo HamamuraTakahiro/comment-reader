@@ -8,3 +8,4 @@ e2e.out
 run.out
 .capture-profile/
 .cap2/
+callnames.json

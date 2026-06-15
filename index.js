@@ -45,6 +45,45 @@ const SPECIAL_ITEMS = {
   34: '貴重な粗品をありがと！',          // 心ばかりの粗品
   35: '貴重なルーレットハートありがと！', // ルーレットハート
 };
+
+// ---- 呼び名DB (userId → 呼び名) ----------------------------------------
+// 「〜と呼んで」コメントで登録。登録ユーザーは その呼び名で(さん抜きで)読む。
+const CALLNAMES_FILE = path.join(__dirname, 'callnames.json');
+let callNames = {};
+try { callNames = JSON.parse(fs.readFileSync(CALLNAMES_FILE, 'utf8')) || {}; } catch (_) { callNames = {}; }
+function saveCallNames() {
+  try { fs.writeFileSync(CALLNAMES_FILE, JSON.stringify(callNames, null, 2)); } catch (e) {
+    console.error('呼び名DBの保存に失敗:', e.message);
+  }
+}
+
+// コメントから「〜と呼んで」を検出し呼び名を抽出する(無ければ null)
+function extractCallName(text) {
+  if (!text) return null;
+  const m = text.match(/(.+?)\s*(?:って|と|で)\s*呼んで/);
+  if (!m) return null;
+  let name = m[1];
+  // 先頭の定型句(私のこと/これからは 等)を繰り返し除去
+  let prev;
+  do {
+    prev = name;
+    name = name
+      .replace(/^(?:これから(?:は)?|今日から|もう|ぜひ|是非|やっぱり?|私|僕|俺|わたし|あたし|自分|あだ名|ニックネーム|名前)/u, '')
+      .replace(/^(?:の)?(?:こと|事)/u, '')
+      .replace(/^(?:を|は|で|って|、|・)/u, '')
+      .trim();
+  } while (name !== prev);
+  name = name.replace(/[「」『』"'、。!！?？\s]/gu, '').trim();
+  if (!name || name.length > 20) return null;
+  return name;
+}
+
+// イベントの話者を解決: 登録済みなら{呼び名, さん無し}、未登録なら{ニックネーム, さん}
+function resolveName(ev) {
+  const custom = ev.userId != null ? callNames[ev.userId] : null;
+  const name = custom || ev.nickname || null;
+  return { name, san: custom ? '' : 'さん' };
+}
 // 読み上げ対象の WebSocket だけに絞るためのURLフィルタ(部分一致)。空なら全部対象。
 const WS_FILTER = process.env.WS_FILTER || '';
 
@@ -168,19 +207,26 @@ function extractEvents(node, out) {
   const ep = body.eventPayload;
   const ts = node.timestamp;
   const pickNick = (o) => (o && typeof o.nickname === 'string' && o.nickname.trim() ? o.nickname.trim() : null);
+  const pickId = (...os) => {
+    for (const o of os) {
+      if (o && (typeof o.id === 'number' || typeof o.id === 'string')) return o.id;
+      if (o && (typeof o.userId === 'number' || typeof o.userId === 'string')) return o.userId;
+    }
+    return null;
+  };
 
   switch (body.eventName) {
     case 'ChatMessage': {
       const text = typeof ep.message === 'string' ? ep.message.trim() : '';
       if (!text) return;
-      out.push({ kind: 'chat', nickname: pickNick(ep.generator), text, ts });
+      out.push({ kind: 'chat', nickname: pickNick(ep.generator), userId: pickId(ep.generator, ep), text, ts });
       return;
     }
     case 'LiveFreeLike': {
       // ハート(無料いいね): { nickname, count }
       const nickname = pickNick(ep) || pickNick(ep.generator);
       const count = Number(ep.count) || 1;
-      out.push({ kind: 'heart', nickname, count, ts });
+      out.push({ kind: 'heart', nickname, userId: pickId(ep, ep.generator), count, ts });
       return;
     }
     case 'LiveDonation': {
@@ -190,7 +236,7 @@ function extractEvents(node, out) {
       const combo = Number(ep.combo) || 1;
       const message = typeof ep.donationMessage === 'string' && ep.donationMessage.trim()
         ? ep.donationMessage.trim() : null;
-      out.push({ kind: 'present', nickname, amount, combo, message, eventName: body.eventName, ts });
+      out.push({ kind: 'present', nickname, userId: pickId(ep, ep.generator), amount, combo, message, eventName: body.eventName, ts });
       return;
     }
     case 'LivePaidLike': {
@@ -198,20 +244,21 @@ function extractEvents(node, out) {
       const nickname = pickNick(ep) || pickNick(ep.generator);
       const amount = Number(ep.amount) || null;
       const combo = Number(ep.combo) || 1;
-      out.push({ kind: 'present', nickname, amount, combo, message: null, eventName: body.eventName, ts });
+      out.push({ kind: 'present', nickname, userId: pickId(ep, ep.generator), amount, combo, message: null, eventName: body.eventName, ts });
       return;
     }
     case 'LiveItemUse': {
       // アイテム使用: { nickname, itemId, effectType, amount, combo }
       // itemId 34 は「心ばかりの粗品」ギフト。effectType "LIKE" はハート。それ以外はアイテム(プレゼント扱い)。
       const nickname = pickNick(ep) || pickNick(ep.generator);
+      const userId = pickId(ep, ep.generator);
       const combo = Number(ep.combo) || 1;
       const phrase = SPECIAL_ITEMS[ep.itemId];
       if (phrase) {
-        out.push({ kind: 'gift', nickname, phrase, ts });
+        out.push({ kind: 'gift', nickname, userId, phrase, ts });
       } else {
         // 未登録のアイテムは、どのアイテムか分かるよう itemId を付けて読み上げる
-        out.push({ kind: 'heart', nickname, count: combo, itemId: ep.itemId, ts });
+        out.push({ kind: 'heart', nickname, userId, count: combo, itemId: ep.itemId, ts });
       }
       return;
     }
@@ -219,7 +266,7 @@ function extractEvents(node, out) {
       // 入室: eventPayload.generator.nickname が入室したユーザー
       const nickname = pickNick(ep.generator) || pickNick(ep);
       if (!nickname) return;
-      out.push({ kind: 'join', nickname, ts });
+      out.push({ kind: 'join', nickname, userId: pickId(ep.generator, ep), ts });
       return;
     }
     default: {
@@ -283,7 +330,13 @@ function normalizeLaughter(s) {
 
 // イベント種別ごとに読み上げ文を組み立てる(対象外なら null)
 function buildUtterance(ev) {
-  const withNick = (nick, rest) => (READ_NICKNAME && nick ? `${nick} さん、${rest}` : rest);
+  // 話者名+「、」を前置。登録済み呼び名なら さん 無し。
+  const withNick = (_unused, rest) => {
+    if (!READ_NICKNAME) return rest;
+    const { name, san } = resolveName(ev);
+    if (!name) return rest;
+    return san ? `${name} ${san}、${rest}` : `${name}、${rest}`;
+  };
   switch (ev.kind) {
     case 'chat': {
       // コメントはユーザー名を読まず本文のみ。
@@ -316,8 +369,10 @@ function buildUtterance(ev) {
       return out;
     }
     case 'join': {
-      if (!READ_JOINS || !ev.nickname) return null;
-      return `${ev.nickname} さんが入室しました`;
+      if (!READ_JOINS) return null;
+      const { name, san } = resolveName(ev);
+      if (!name) return null;
+      return san ? `${name} ${san}が入室しました` : `${name}が入室しました`;
     }
     default:
       return null;
@@ -447,6 +502,17 @@ async function main() {
           : `${ev.eventName}:${ev.amount}:${ev.combo}`;
         const key = `${ev.kind}::${ev.ts || ''}::${ev.nickname || ''}::${id}`;
         if (isDuplicate(key)) continue;
+
+        // コメントに「〜と呼んで」があれば呼び名を登録
+        if (ev.kind === 'chat' && ev.userId != null) {
+          const callName = extractCallName(ev.text);
+          if (callName && callNames[ev.userId] !== callName) {
+            callNames[ev.userId] = callName;
+            saveCallNames();
+            console.log(`📝 呼び名を登録: ${ev.nickname || ev.userId} → 「${callName}」`);
+            enqueueSpeak(`これから ${callName} と呼びますね`);
+          }
+        }
 
         const utterance = buildUtterance(ev);
         if (utterance == null) continue; // 種別OFF等で読み上げ対象外
