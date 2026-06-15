@@ -40,6 +40,8 @@ const READ_NICKNAME = process.env.NO_NICKNAME !== '1';
 const READ_HEARTS = process.env.NO_HEARTS !== '1';   // ハート(無料いいね)を読み上げる
 const READ_PRESENTS = process.env.NO_PRESENTS !== '1'; // Spoon投げ/有料いいね等のプレゼントを読み上げる
 const READ_JOINS = process.env.NO_JOINS !== '1';       // 入室を読み上げる
+const READ_LEAVES = process.env.NO_LEAVES !== '1';     // 退室を読み上げる(リスナー一覧の差分で検出)
+const LISTENER_POLL_MS = Math.max(3000, parseInt(process.env.LISTENER_POLL_MS, 10) || 12000); // 一覧取得間隔
 // 特別読み上げするアイテム(itemId → 読み上げ文)。未登録のアイテムはidを付けて読み上げる。
 const SPECIAL_ITEMS = {
   34: '貴重な粗品をありがと！',          // 心ばかりの粗品
@@ -269,6 +271,11 @@ function extractEvents(node, out) {
       out.push({ kind: 'join', nickname, userId: pickId(ep.generator, ep), ts });
       return;
     }
+    case 'LiveMetaUpdate': {
+      // 配信メタ更新。現在のリスナー数(memberCount)変化を退室検出のトリガに使う。
+      if (ep.memberCount != null) out.push({ kind: 'meta', memberCount: Number(ep.memberCount) });
+      return;
+    }
     default: {
       // 上記以外のプレゼント系イベントの保険(将来Spoon側でイベント名が増えた場合)。
       // eventName に Present/Spoon/Sticker/Gift/Combo を含むものはベストエフォートで拾う。
@@ -373,6 +380,12 @@ function buildUtterance(ev) {
       const { name, san } = resolveName(ev);
       if (!name) return null;
       return san ? `${name} ${san}が入室しました` : `${name}が入室しました`;
+    }
+    case 'leave': {
+      if (!READ_LEAVES) return null;
+      const { name, san } = resolveName(ev);
+      if (!name) return null;
+      return san ? `${name} ${san}、またね` : `${name}、またね`;
     }
     default:
       return null;
@@ -486,6 +499,44 @@ async function main() {
   const page = existing.length > 0 ? existing[0] : await context.newPage();
   for (const p of existing) attachPage(p);
 
+  // 1イベントを処理(重複排除→呼び名登録→読み上げ)
+  function emitEvent(ev) {
+    const id = ev.kind === 'chat' ? ev.text
+      : ev.kind === 'heart' ? `heart:${ev.itemId ?? ''}:${ev.count}`
+      : ev.kind === 'join' ? 'join'
+      : ev.kind === 'leave' ? 'leave'
+      : ev.kind === 'gift' ? `gift:${ev.phrase}`
+      : `${ev.eventName}:${ev.amount}:${ev.combo}`;
+    // 退室は reconcile 側で在室Mapから消すため二重発火しない。再入室→再退室を許すため重複排除しない。
+    if (ev.kind !== 'leave') {
+      const key = `${ev.kind}::${ev.ts || ''}::${ev.nickname || ''}::${ev.userId || ''}::${id}`;
+      if (isDuplicate(key)) return;
+    }
+
+    // コメントに「〜と呼んで」があれば呼び名を登録
+    if (ev.kind === 'chat' && ev.userId != null) {
+      const callName = extractCallName(ev.text);
+      if (callName && callNames[ev.userId] !== callName) {
+        callNames[ev.userId] = callName;
+        saveCallNames();
+        console.log(`📝 呼び名を登録: ${ev.nickname || ev.userId} → 「${callName}」`);
+        enqueueSpeak(`これから ${callName} と呼びますね`);
+      }
+    }
+
+    const utterance = buildUtterance(ev);
+    if (utterance == null) return; // 種別OFF等で読み上げ対象外
+
+    const icon = ev.kind === 'chat' ? '💬'
+      : ev.kind === 'heart' ? '🩷'
+      : ev.kind === 'join' ? '👋'
+      : ev.kind === 'leave' ? '🚪'
+      : ev.kind === 'gift' ? '🎁'
+      : '🥄';
+    console.log(`${icon} ${ev.nickname ? ev.nickname + ': ' : ''}${utterance}`);
+    enqueueSpeak(utterance);
+  }
+
   function handlePayload(payload) {
     let objs;
     try { objs = parseFrame(payload); } catch (_) { return; }
@@ -493,39 +544,115 @@ async function main() {
       const found = [];
       extractEvents(obj, found);
       for (const ev of found) {
+        if (ev.kind === 'meta') { onMemberCount(ev.memberCount); continue; }
         if (ev.kind === 'chat' && !looksLikeChat(ev.text)) continue;
-        // 重複排除キー(同一フレーム二重配信や再送に備える)
-        const id = ev.kind === 'chat' ? ev.text
-          : ev.kind === 'heart' ? `heart:${ev.itemId ?? ''}:${ev.count}`
-          : ev.kind === 'join' ? 'join'
-          : ev.kind === 'gift' ? `gift:${ev.phrase}`
-          : `${ev.eventName}:${ev.amount}:${ev.combo}`;
-        const key = `${ev.kind}::${ev.ts || ''}::${ev.nickname || ''}::${id}`;
-        if (isDuplicate(key)) continue;
-
-        // コメントに「〜と呼んで」があれば呼び名を登録
-        if (ev.kind === 'chat' && ev.userId != null) {
-          const callName = extractCallName(ev.text);
-          if (callName && callNames[ev.userId] !== callName) {
-            callNames[ev.userId] = callName;
-            saveCallNames();
-            console.log(`📝 呼び名を登録: ${ev.nickname || ev.userId} → 「${callName}」`);
-            enqueueSpeak(`これから ${callName} と呼びますね`);
-          }
-        }
-
-        const utterance = buildUtterance(ev);
-        if (utterance == null) continue; // 種別OFF等で読み上げ対象外
-
-        const icon = ev.kind === 'chat' ? '💬'
-          : ev.kind === 'heart' ? '🩷'
-          : ev.kind === 'join' ? '👋'
-          : ev.kind === 'gift' ? '🎁'
-          : '🥄';
-        console.log(`${icon} ${ev.nickname ? ev.nickname + ': ' : ''}${utterance}`);
-        enqueueSpeak(utterance);
+        // 入室は在室登録しておく(即入室即退室でも一覧差分で拾えるように)
+        if (ev.kind === 'join' && ev.userId != null) markPresent(ev.userId, ev.nickname);
+        emitEvent(ev);
       }
     }
+  }
+
+  // ---- 退室検出: リスナー一覧を定期取得し、いなくなった人を「またね」 ----
+  let liveId = null;         // 配信の数値ID(/lives/{id}/ から取得)
+  let apiOrigin = 'https://jp-api.spooncast.net';
+  let authToken = null;      // APIのAuthorizationヘッダ
+  const present = new Map();  // 在室中 Map(userId文字列 → nickname)
+  let seeded = false;         // 初回スナップショット取得済みか(初回は退室判定しない)
+  const listenersUrl = () => (liveId ? `${apiOrigin}/lives/${liveId}/listeners/` : null);
+
+  function parseListeners(json) {
+    const arr = Array.isArray(json) ? json
+      : json.results || json.listeners
+      || (json.data && (json.data.results || json.data.listeners || json.data)) || [];
+    const out = [];
+    for (const it of (Array.isArray(arr) ? arr : [])) {
+      const u = (it && (it.author || it.user)) || it || {};
+      const uid = u.id ?? it.id ?? it.userId;
+      const nickname = u.nickname ?? it.nickname ?? null;
+      if (uid != null) out.push({ id: String(uid), nickname });
+    }
+    return out;
+  }
+
+  const numify = (id) => (/^\d+$/.test(id) ? Number(id) : id);
+
+  // 入室で在室登録(即入室即退室にも対応するため、一覧取得前に記録しておく)
+  function markPresent(userId, nickname) {
+    if (userId == null) return;
+    present.set(String(userId), nickname || present.get(String(userId)) || null);
+  }
+
+  // リスナー一覧スナップショットと在室Mapを突き合わせ、いなくなった人を「またね」
+  function reconcile(list) {
+    const cur = new Map();
+    for (const u of list) cur.set(u.id, u.nickname);
+    if (DEBUG) logFrame(`[LISTENERS] n=${cur.size} present=${present.size} ids=${[...cur.keys()].join(',')}`);
+    if (seeded) {
+      // 在室登録されていて今回の一覧に居ない人 = 退室
+      for (const [uid, nick] of [...present]) {
+        if (!cur.has(uid)) {
+          emitEvent({ kind: 'leave', userId: numify(uid), nickname: nick });
+          present.delete(uid);
+        }
+      }
+    }
+    // 一覧に居る人は在室として反映(名前も更新)
+    for (const [uid, nick] of cur) present.set(uid, nick || present.get(uid) || null);
+    seeded = true;
+  }
+
+  async function pollListeners() {
+    const url = listenersUrl();
+    if (!url) { if (DEBUG) logFrame('[LISTENERS] liveId未取得'); return; }
+    try {
+      const json = await page.evaluate(async ({ u, token }) => {
+        const tryFetch = async (opts) => {
+          try {
+            const r = await fetch(u, opts);
+            if (!r.ok) return { __status: r.status };
+            return await r.json();
+          } catch (e) { return { __error: String(e) }; }
+        };
+        let res = await tryFetch(token ? { headers: { Authorization: token } } : {});
+        if (res && (res.__error || res.__status)) {
+          const res2 = await tryFetch({});
+          if (!(res2 && (res2.__error || res2.__status))) res = res2;
+        }
+        return res;
+      }, { u: url, token: authToken });
+      if (json && json.__error) { if (DEBUG) logFrame(`[LISTENERS] fetch error: ${json.__error}`); return; }
+      if (json && json.__status) { if (DEBUG) logFrame(`[LISTENERS] HTTP ${json.__status}`); return; }
+      const list = parseListeners(json);
+      if (DEBUG) logFrame(`[LISTENERS] live=${liveId} n=${list.length} names=${list.map((x) => x.nickname).join(',')}`);
+      reconcile(list);
+    } catch (e) { if (DEBUG) logFrame(`[LISTENERS] evaluate error: ${e && e.message}`); }
+  }
+
+  // 現在のリスナー数(memberCount)が変化したら、少し待ってから一覧をチェック(退室者特定)
+  let lastMemberCount = null;
+  let pollScheduled = false;
+  function onMemberCount(n) {
+    if (n == null || n === lastMemberCount) return;
+    if (DEBUG) logFrame(`[META] memberCount ${lastMemberCount} -> ${n}`);
+    lastMemberCount = n;
+    if (!READ_LEAVES || pollScheduled) return;
+    pollScheduled = true;
+    setTimeout(() => { pollScheduled = false; pollListeners(); }, 1500);
+  }
+
+  if (READ_LEAVES) {
+    // 各APIリクエストから配信IDと認証トークンを拾う
+    context.on('request', (req) => {
+      const u = req.url();
+      const m = u.match(/^(https?:\/\/[^/]+)\/lives\/(\d+)\//);
+      if (m) {
+        apiOrigin = m[1];
+        const a = req.headers()['authorization']; if (a) authToken = a;
+        if (m[2] !== liveId) { liveId = m[2]; seeded = false; present.clear(); pollListeners(); } // 別配信に移ったら在室リセット
+      }
+    });
+    // ポーリングは行わず、memberCount(人型の数値)が変化したタイミングで一覧取得する
   }
 
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' }).catch((e) => {
